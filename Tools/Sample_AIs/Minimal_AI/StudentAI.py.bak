@@ -1,0 +1,187 @@
+# StudentAI.py — Minimal AI with alpha–beta and simple heuristics
+from Move import Move
+import copy
+
+class StudentAI:
+    """
+    Should beat/tie Random ≥60% on 7x7,k=2.
+    Depth-limited minimax + alpha-beta + light move ordering.
+    """
+
+    def __init__(self, col=7, row=7, k=2, first=1, time=1200):
+        self.col = col
+        self.row = row
+        self.k = k
+        self.color = first           # 1 = White ("W"), 2 = Black ("B")
+        self.opponent = {1: 2, 2: 1}
+        self.board = None            # set on first get_move
+        self.max_depth = 2           # start at 2 for stability/speed; try 3 later
+
+def get_move(self, move):
+    # lazy init of board
+    if self.board is None:
+        from BoardClasses import Board
+        self.board = Board(self.col, self.row, self.k)
+
+        # auto-detect our color from the first call
+        if len(move) == 0:
+            self.color = 1  # White moves first
+        else:
+            self.color = 2  # We’re Black (opponent has already moved)
+
+    # apply opponent move if present
+    if len(move) != 0:
+        try:
+            self.board.make_move(move, self.opponent[self.color])
+        except Exception:
+            pass  # stay resilient if their move can’t be applied
+
+    # our legal moves
+    moves_grouped = self.board.get_all_possible_moves(self.color)
+    if not moves_grouped or all(len(g) == 0 for g in moves_grouped):
+        return Move([])  # no legal move
+
+    flat = [m for g in moves_grouped for m in g]
+    if len(flat) == 1:
+        chosen = flat[0]
+        self.board.make_move(chosen, self.color)
+        return chosen
+
+    alpha, beta = float("-inf"), float("inf")
+    best_score, best_move = float("-inf"), None
+
+    for m in self._order_moves(flat):
+        child = self._apply(self.board, m, self.color)
+        if child is None:
+            cont
+
+
+    # -------- minimax ----------
+    def _max_value(self, board, depth, alpha, beta):
+        term = board.is_win(self.opponent[self.color])
+        if term != 0 or depth == 0:
+            return self._evaluate(board)
+
+        moves = board.get_all_possible_moves(self.color)
+        if not moves:
+            return self._evaluate(board)
+
+        value = float("-inf")
+        for m in self._order_moves([mm for g in moves for mm in g]):
+            child = self._apply(board, m, self.color)
+            value = max(value, self._min_value(child, depth - 1, alpha, beta))
+            if value >= beta:
+                return value
+            alpha = max(alpha, value)
+        return value
+
+    def _min_value(self, board, depth, alpha, beta):
+        term = board.is_win(self.color)
+        if term != 0 or depth == 0:
+            return self._evaluate(board)
+
+        moves = board.get_all_possible_moves(self.opponent[self.color])
+        if not moves:
+            return self._evaluate(board)
+
+        value = float("inf")
+        for m in self._order_moves([mm for g in moves for mm in g]):
+            child = self._apply(board, m, self.opponent[self.color])
+            value = min(value, self._max_value(child, depth - 1, alpha, beta))
+            if value <= alpha:
+                return value
+            beta = min(beta, value)
+        return value
+
+    # -------- helpers ----------
+    def _legal_flat(self, board, color):
+        groups = board.get_all_possible_moves(color)
+        return [m for g in groups for m in g] if groups else []
+
+    def _is_still_legal(self, board, color, move):
+        legal_now = self._legal_flat(board, color)
+        # Compare by string form to avoid object identity issues
+        sm = str(move)
+        return any(str(x) == sm for x in legal_now)
+
+    def _safe_apply(self, board, move, who):
+        """Deep-copy apply; return None if the move throws InvalidMoveError."""
+        nb = copy.deepcopy(board)
+        try:
+            nb.make_move(move, who)
+            return nb
+        except Exception:
+            return None
+
+    def _order_moves(self, moves):
+        # longer sequences => likely captures; also prefer promotions
+        def key(m):
+            seq = m.seq
+            length = len(seq)
+            cap_bonus = max(0, length - 2) * 10
+            end_r, _ = seq[-1]
+            promo = 0
+            if self.color == 1:       # white promotes at top row 0
+                promo = 1 if end_r == 0 else 0
+            else:                     # black promotes at bottom
+                promo = 1 if end_r == self.row - 1 else 0
+            return cap_bonus + promo * 5
+        return sorted(moves, key=key, reverse=True)
+
+    # -------- evaluation ----------
+    def _evaluate(self, board):
+        """
+        Fast linear eval:
+        + kings, + men, + mobility, + center, + advancement
+        """
+        my_men = my_kings = opp_men = opp_kings = 0
+        my_center = opp_center = 0
+        my_adv = opp_adv = 0
+
+        # piece counts & features
+        for r in range(self.row):
+            for c in range(self.col):
+                piece = board.board[r][c]
+                if piece == ".":
+                    continue
+                is_king = getattr(piece, "is_king", False)
+                pcolor = getattr(piece, "color", ".")
+
+                is_me = (pcolor == ("W" if self.color == 1 else "B"))
+                is_opp = (pcolor == ("B" if self.color == 1 else "W"))
+
+                if is_me:
+                    if is_king: my_kings += 1
+                    else:       my_men   += 1
+                    if 1 <= r <= self.row - 2 and 1 <= c <= self.col - 2:
+                        my_center += 1
+                    # advancement toward promotion
+                    my_adv += (self.row - 1 - r) if self.color == 1 else r
+                elif is_opp:
+                    if is_king: opp_kings += 1
+                    else:       opp_men   += 1
+                    if 1 <= r <= self.row - 2 and 1 <= c <= self.col - 2:
+                        opp_center += 1
+                    opp_adv += r if self.color == 1 else (self.row - 1 - r)
+
+        # mobility
+        my_moves = board.get_all_possible_moves(self.color)
+        opp_moves = board.get_all_possible_moves(self.opponent[self.color])
+        my_mob = sum(len(g) for g in my_moves)
+        opp_mob = sum(len(g) for g in opp_moves)
+
+        # terminal states (board.is_win: self=1/2, -1=draw, 0=playing)
+        tself = board.is_win(self.color)
+        if tself == self.color:                # we win
+            return 10000
+        if tself == self.opponent[self.color]: # we lose
+            return -10000
+        if tself == -1:                        # draw
+            return 0
+
+        score  = 100 * (my_kings - opp_kings)
+        score +=  50 * (my_men   - opp_men)
+        score +=   5 * (my_mob   - opp_mob)
+        score +=   2 * (my_center - opp_center)
+        score +=   1 * (my_adv     - opp_adv)
+        return score
