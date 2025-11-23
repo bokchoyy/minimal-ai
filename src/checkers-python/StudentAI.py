@@ -1,223 +1,239 @@
-# StudentAI.py
-# Minimal AI: Minimax + Alpha-Beta with simple heuristics
-from random import randint
 import copy
+import math
+import time
+from random import choice
 from Move import Move
+
+
+class MCTSNode:
+    """
+    Node for Monte Carlo Tree Search.
+    Holds a board state, whose turn it is next, and statistics.
+    """
+
+    def __init__(self, board, player_to_move, ai, parent=None, move=None):
+        self.board = board
+        self.player_to_move = player_to_move  # 1 or 2
+        self.ai = ai
+
+        self.parent = parent
+        self.move = move  # Move that led here from parent
+
+        self.children = []
+        self.untried_moves = ai._get_all_moves(board, player_to_move)
+
+        self.wins = 0.0
+        self.visits = 0
+
+    def is_fully_expanded(self):
+        return len(self.untried_moves) == 0
+
+    def is_terminal(self):
+        # Use ai.color and its opponent to detect end states
+        w_self = self.board.is_win(self.ai.color)
+        w_opp = self.board.is_win(self.ai.opponent[self.ai.color])
+        # If either side has a result, or there are no moves left, treat as terminal
+        return (w_self != 0) or (w_opp != 0) or (len(self.untried_moves) == 0)
+
+    def best_child_ucb(self, c):
+        """Return child with highest UCB1 score."""
+        best_score = float("-inf")
+        best_child = None
+        for child in self.children:
+            if child.visits == 0:
+                score = float("inf")
+            else:
+                exploit = child.wins / child.visits
+                explore = math.sqrt(math.log(self.visits) / child.visits)
+                score = exploit + c * explore
+            if score > best_score:
+                best_score = score
+                best_child = child
+        return best_child
+
 
 class StudentAI:
     """
-    Minimal AI: should beat/tie the provided Random AI ≥60%.
-    Uses depth-limited minimax with alpha–beta pruning and simple move ordering.
+    MCTS-based AI for Draft AI project.
+    Uses time-bounded Monte Carlo Tree Search with UCB1.
     """
 
     def __init__(self, col=7, row=7, k=2, first=1, time=1200):
-        # color: 1 = White (W) moves "up", 2 = Black (B) moves "down"
         self.col = col
         self.row = row
         self.k = k
-        self.color = first
+
+        # Start assuming we are player 2; we will detect if we are actually player 1
+        # on the first call to get_move based on whether move is [] or not.
+        self.color = 2
         self.opponent = {1: 2, 2: 1}
-        self.board = None  # will be set by framework via get_move’s first call
-        # search params (tweakable)
-        self.max_depth = 3
+
+        self.board = None  # will be set (or lazily initialized)
+
+        # MCTS parameters
+        self.exploration_c = 1.4
+        # Per-move time budget in seconds (safe vs 300s/game)
+        self.time_per_move = 0.7
 
     def get_move(self, move):
         """
         Called by the game loop with the opponent's last move.
         We must return our chosen Move.
         """
-        # Initialize board lazily
-        if self.board is None:
-            # Board is created inside BoardClasses when GameLogic sets up the AIs.
-            # Framework will assign self.board before our first decision by giving us
-            # the opponent's move==[] for the very first call.
-            # But to be safe, we fallback to importing BoardClasses and creating one.
-            try:
-                from BoardClasses import Board
-                self.board = Board(self.col, self.row, self.k)
-            except Exception:
-                pass
 
-        # If opponent moved, apply it locally
-        if len(move) != 0:
+        # Lazy board initialization
+        if self.board is None:
+            from BoardClasses import Board
+            self.board = Board(self.col, self.row, self.k)
+            self.board.initialize_game()
+
+        # --- Determine our color and apply opponent move correctly ---
+        if len(move) == 0:
+            # No opponent move yet => we are Player 1
+            self.color = 1
+        else:
+            # Opponent just moved; apply it.
+            # If this is our first call and we are Player 2,
+            # self.color is still 2, so opponent[2] = 1, which is correct.
             self.board.make_move(move, self.opponent[self.color])
 
-        # Generate all our legal moves
-        moves_grouped = self.board.get_all_possible_moves(self.color)
-        if not moves_grouped:
-            # No legal moves -> return an empty move (resigns)
+        # Generate all possible moves for us
+        move_groups = self.board.get_all_possible_moves(self.color)
+        if not move_groups:
+            # No legal moves => resign
             return Move([])
 
-        # If only one move exists overall, take it quickly
-        flat = [m for group in moves_grouped for m in group]
-        if len(flat) == 1:
-            chosen = flat[0]
+        flat_moves = [m for g in move_groups for m in g]
+        if len(flat_moves) == 1:
+            # Only one move; no need to search
+            chosen = flat_moves[0]
             self.board.make_move(chosen, self.color)
             return chosen
 
-        # Choose via minimax
-        best_score = float("-inf")
-        best_move = None
+        # --- MCTS SEARCH ---
+        root_board = copy.deepcopy(self.board)
+        root = MCTSNode(root_board, self.color, ai=self)
 
-        # Order: captures first, then others
-        candidate_moves = self._order_moves(flat)
+        end_time = time.time() + self.time_per_move
 
-        alpha = float("-inf")
-        beta = float("inf")
+        while time.time() < end_time:
+            node = root
 
-        for m in candidate_moves:
-            new_board = self._apply(self.board, m, self.color)
-            score = self._min_value(new_board, self.max_depth - 1, alpha, beta)
-            if score > best_score:
-                best_score = score
-                best_move = m
-            alpha = max(alpha, best_score)
+            # 1. SELECTION: descend via UCB until node with untried moves or terminal
+            while node.is_fully_expanded() and node.children:
+                node = node.best_child_ucb(self.exploration_c)
 
-        # Apply chosen move to our real board and return it
-        self.board.make_move(best_move, self.color)
-        return best_move
+            # 2. EXPANSION: expand one untried move (if non-terminal)
+            if node.untried_moves and not node.is_terminal():
+                m = node.untried_moves.pop()
+                next_board = copy.deepcopy(node.board)
+                next_board.make_move(m, node.player_to_move)
+                next_player = self.opponent[node.player_to_move]
+                child = MCTSNode(next_board, next_player, ai=self, parent=node, move=m)
+                node.children.append(child)
+                node = child
 
-    # --- Minimax with alpha–beta ---
+            # 3. SIMULATION: rollout from this node
+            winner = self._rollout(node.board, node.player_to_move)
 
-    def _max_value(self, board, depth, alpha, beta):
-        winner = board.is_win(self.opponent[self.color])  # did opponent just lose?
-        if winner != 0 or depth == 0:
-            return self._evaluate(board)
+            # 4. BACKPROPAGATION: update stats up the tree
+            self._backpropagate(node, winner)
 
-        moves = board.get_all_possible_moves(self.color)
-        if not moves:
-            return self._evaluate(board)
+        # Choose the child with the most visits (robust child)
+        if not root.children:
+            # Fallback: just pick the first legal move if something went wrong
+            chosen = flat_moves[0]
+        else:
+            best_child = max(root.children, key=lambda c: c.visits)
+            chosen = best_child.move
 
-        flat = [m for group in moves for m in group]
-        flat = self._order_moves(flat)
+        # Apply chosen move on actual game board
+        self.board.make_move(chosen, self.color)
+        return chosen
 
-        value = float("-inf")
-        for m in flat:
-            child = self._apply(board, m, self.color)
-            value = max(value, self._min_value(child, depth - 1, alpha, beta))
-            if value >= beta:
-                return value
-            alpha = max(alpha, value)
-        return value
+    # ---------- helpers for moves / rollout / evaluation ----------
 
-    def _min_value(self, board, depth, alpha, beta):
-        winner = board.is_win(self.color)  # did we just lose?
-        if winner != 0 or depth == 0:
-            return self._evaluate(board)
+    def _get_all_moves(self, board, player):
+        groups = board.get_all_possible_moves(player)
+        if not groups:
+            return []
+        return [m for g in groups for m in g]
 
-        moves = board.get_all_possible_moves(self.opponent[self.color])
-        if not moves:
-            return self._evaluate(board)
-
-        flat = [m for group in moves for m in group]
-        flat = self._order_moves(flat)  # ordering helps pruning even for opponent
-
-        value = float("inf")
-        for m in flat:
-            child = self._apply(board, m, self.opponent[self.color])
-            value = min(value, self._max_value(child, depth - 1, alpha, beta))
-            if value <= alpha:
-                return value
-            beta = min(beta, value)
-        return value
-
-    # --- Helpers ---
-
-    def _apply(self, board, move, who):
-        """Return a deep-copied board after applying `move` for player `who`."""
-        nb = copy.deepcopy(board)
-        nb.make_move(move, who)
-        return nb
-
-    def _order_moves(self, moves):
+    def _rollout(self, board, player_to_move, max_steps=80):
         """
-        Prioritize capturing / longer sequences (likely captures),
-        then potential promotions, then others.
+        Play random moves until terminal or max_steps reached.
+        Return the winner: self.color, self.opponent[self.color], or -1 for draw.
         """
-        def score_move(m: Move):
-            seq = m.seq
-            length = len(seq)
-            # longer sequences likely include captures
-            cap_bonus = max(0, length - 2)
-            # promotion chance heuristic: reaching last row for our color
-            promo = 0
-            end_r, _ = seq[-1]
-            if self.color == 1:  # White promotes at top (row 0)
-                if end_r == 0:
-                    promo = 1
-            else:                # Black promotes at bottom (last row)
-                if end_r == self.row - 1:
-                    promo = 1
-            return (cap_bonus * 10) + (promo * 5)
+        current_player = player_to_move
+        steps = 0
+        tmp_board = copy.deepcopy(board)
 
-        return sorted(moves, key=score_move, reverse=True)
+        while steps < max_steps:
+            steps += 1
 
-    # --- Evaluation ---
+            # Check terminal from both perspectives
+            w_self = tmp_board.is_win(self.color)
+            w_opp = tmp_board.is_win(self.opponent[self.color])
+            if w_self == self.color:
+                return self.color
+            if w_opp == self.opponent[self.color]:
+                return self.opponent[self.color]
+            if w_self == -1 or w_opp == -1:
+                return -1  # draw
 
-    def _evaluate(self, board):
+            moves = self._get_all_moves(tmp_board, current_player)
+            if not moves:
+                # Current player stuck => other player wins
+                return self.opponent[current_player]
+
+            m = choice(moves)
+            tmp_board.make_move(m, current_player)
+            current_player = self.opponent[current_player]
+
+        # If rollout didn't terminate, decide winner by material
+        return self._material_winner(tmp_board)
+
+    def _material_winner(self, board):
         """
-        Simple, fast, and effective for Minimal AI.
-        Positive = good for self.color.
+        Heuristic winner if rollout doesn't finish in time:
+        whoever has more material (kings weighted more).
         """
-        my_men = my_kings = opp_men = opp_kings = 0
-        my_mob = opp_mob = 0
-        my_center = opp_center = 0
-        my_adv = opp_adv = 0
+        my_color_char = "W" if self.color == 1 else "B"
+        opp_color_char = "B" if self.color == 1 else "W"
 
-        # Count pieces and features
+        my_score = 0
+        opp_score = 0
+
         for r in range(self.row):
             for c in range(self.col):
                 piece = board.board[r][c]
                 if piece == ".":
                     continue
-                is_king = getattr(piece, "is_king", False)
                 pcolor = getattr(piece, "color", ".")
-                center = 1 if (1 <= r <= self.row - 2 and 1 <= c <= self.col - 2) else 0
+                king = getattr(piece, "is_king", False)
+                val = 3 if king else 1
 
-                if pcolor == "W":
-                    if is_king: 
-                        w = "king"
-                    if self.color == 1:
-                        (my_kings if is_king else my_men).__class__
-                    # both branches handled below
-                # Count by perspective
-                if pcolor == ("W" if self.color == 1 else "B"):
-                    if is_king: my_kings += 1
-                    else:       my_men   += 1
-                    my_center += center
-                    # advancement toward king row
-                    if self.color == 1:
-                        my_adv += (self.row - 1 - r)  # white moves up (smaller r), farther from bottom is "advanced"
-                    else:
-                        my_adv += r
-                elif pcolor in ("W", "B"):
-                    if is_king: opp_kings += 1
-                    else:       opp_men   += 1
-                    opp_center += center
-                    if self.color == 1:
-                        opp_adv += r
-                    else:
-                        opp_adv += (self.row - 1 - r)
+                if pcolor == my_color_char:
+                    my_score += val
+                elif pcolor == opp_color_char:
+                    opp_score += val
 
-        # Mobility (legal moves count)
-        my_moves = board.get_all_possible_moves(self.color)
-        opp_moves = board.get_all_possible_moves(self.opponent[self.color])
-        my_mob = sum(len(g) for g in my_moves)
-        opp_mob = sum(len(g) for g in opp_moves)
+        if my_score > opp_score:
+            return self.color
+        elif opp_score > my_score:
+            return self.opponent[self.color]
+        else:
+            return -1  # draw
 
-        # Terminal detection (board.is_win returns 1/2 winner or -1 for draw)
-        term = board.is_win(self.color)
-        if term == self.color:
-            return 10_000
-        elif term == self.opponent[self.color]:
-            return -10_000
-        elif term == -1:
-            return 0
-
-        # Weighted sum
-        score  = 100 * (my_kings - opp_kings)
-        score +=  50 * (my_men   - opp_men)
-        score +=   5 * (my_mob   - opp_mob)
-        score +=   2 * (my_center - opp_center)
-        score +=   1 * (my_adv     - opp_adv)
-        return score
+    def _backpropagate(self, node, winner):
+        """
+        Update visits and wins along the path back to the root.
+        """
+        while node is not None:
+            node.visits += 1
+            if winner == self.color:
+                node.wins += 1.0
+            elif winner == -1:
+                node.wins += 0.5  # count draw as half-win
+            # opponent win → 0
+            node = node.parent
